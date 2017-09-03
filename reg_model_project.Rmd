@@ -1,0 +1,251 @@
+---
+title: "Modeling and prediction for movies"
+output: 
+  html_document: 
+    fig_height: 4
+    highlight: pygments
+    theme: spacelab
+---
+
+#### Load packages
+
+```{r load-packages, message = FALSE}
+options(warn=-1) # turn off warnings
+library(ggplot2)
+library(dplyr)
+library(statsr)
+library(tidyr)
+library(knitr)
+library(colorspace)
+library(GGally)
+library(ggpubr)
+library(cowplot)
+library(gender)
+library(leaps)
+```
+
+***
+
+#### Load data
+
+```{r load-data}
+load("movies.Rdata")
+```
+***
+
+## Part 1: Data
+
+The data set is comprised of 651 randomly sampled reviews of movies produced and released before 2016, and was obtained via the IMDB and Rotten Tomatoes APIs.  The population thus corresponds to all ratings of movies on Rotten Tomatoes and IMDB that were produced and released before 2016.
+
+The data collection methodology of random sampling is designed to represent the population, so the sample is generalizable to this population.
+
+Because we are not actively collecting data for the study, our following analysis is strictly observational. We can not infer any causality among the variables in our analysis.
+
+Finally, note that 651 movies is well under 10% of all movies on these websites, so we can assume that the reviews are independent.
+
+***
+
+## Part 2: Research question
+
+<b>Question:</b>  Which features are most important in predicting the popularity of a movie?
+
+Say we want to produce a movie from scratch.  Which salient properties of the movie and its release features are most <i>statistically</i> important to predict how popular, as measured by viewer ratings, the movie will be?
+
+To address this question, we will build a multiple linear regression model to predict the dependent variable `imdb_rating`,  which is the numerical user-rating score from the IMDB website.
+
+In the spirit of making a predictive model, we will omit variables that "leak data" from our predictive analysis.  So, we will only keep variables that we <i>could</i> know from the outset of producing a movie and planning its release.  For example, we will drop the variable corresponding to Rotten Tomatoes user ratings, `audience_score`, and other similar variables.
+
+***
+
+## Part 3: Exploratory data analysis
+
+Below is a histgram and summary of the dependent `imdb_rating` variable, for which we will build a predictive multiple regression model.  One can see that it is approximately normally distributed, with a slight left skew, a mean of 6.5, and a median of 6.6.
+
+```{r}
+ggplot(aes(imdb_rating), data = movies) + geom_histogram(bins=15) + xlab("IMDB ratings")
+summary(movies$imdb_rating)
+```
+
+#### Eliminating data leakage
+
+We identify all variables that are sources of "data leakage," meaning that there would be no way of collecting data for these variables before the movie is produced and released.  Remember, we wish to create a predictive model that is relevant for someone who is creating a movie.
+
+The chosen dependent variable for popularity is `imdb_rating` from the IMDB website, but the data frame also includes ratings data from the Rotten Tomatoes website.  Surely, we expect these variables to be highly correlated, and the Rotten Tomatoes ratings data could not exist before a movie is produced.  Below, we show a scatter plot of the IMDB ratings as a function of the Rotten Tomatoes ratings, and calculate their Pearson correlation coefficient.
+
+The scatter plot shows a strong nearly-linear relationship, which is supported by a correlation of 0.8649 and a corresponding $R^2$ of 0.7481.  Certainly, the Rotten Tomatoes ratings would serve as an excellent predictor for the IMDB ratings, but they must be eliminated for the problem at hand.
+
+```{r}
+ggplot(movies, aes(audience_score, imdb_rating)) + geom_jitter() + xlab("Rotten Tomatoes ratings (0-100)") + ylab("IMDB ratings (0-10)") + stat_smooth(method = "lm")
+movies %>% summarise(cor(imdb_rating, audience_score))
+```
+
+We now eliminate all variables that correspond to data leakage for the problem (`audience_score`, `imdb_num_votes`, `critics_score`, `critics_rating`, `audience_rating`, `best_pic_nom`, `best_pic_win`, `best_actor_win`, `best_actress_win`, `best_dir_win`,and `top200_box`).
+
+```{r}
+leakcols = c("audience_score","imdb_num_votes","critics_score","critics_rating","audience_rating","best_pic_nom","best_pic_win","best_actor_win","best_actress_win","best_dir_win","top200_box")
+cols = names(movies)
+movies = movies[cols[!cols %in% leakcols]]
+```
+
+#### Creating new variables
+
+Here we create new variables, or features, based on the remaining explanatory variables.
+
+Using the year, month, and day of release of each movie, we can construct a day of the week variable (i.e. Monday, Tuesday, etc.).  We do this below for both theatre and DVD release dates, calling the new variables `thtr_rel_dow` and `DVD_rel_dow`, respectively.
+
+```{r}
+movies$thtr_rel_dow <-as.factor(weekdays(as.Date(paste(movies$thtr_rel_year, movies$thtr_rel_month, movies$thtr_rel_day,sep="-"), format="%Y-%m-%d")))
+movies$dvd_rel_dow <- as.factor(weekdays(as.Date(paste(movies$dvd_rel_year, movies$dvd_rel_month, movies$dvd_rel_day,sep="-"), format="%Y-%m-%d")))
+```
+
+Using the R `gender` library, we can use the first name of the lead actor, from the `actor1` variable, to determine if the lead actor of the rated film is male or female.  We call this new variable `ismale`, which is 1 is the actor is male, and is 0 otherwise.
+
+```{r}
+movies$ismale <- NA
+ismalefun <- function(x) {
+  tmp = as.numeric(gender(strsplit(x, " ")[[1]][1])[2])
+  if (tmp>0.5 | is.na(tmp)) {return(1)}
+  else {return(0)} }
+movies$ismale <- lapply(movies$actor1, function(x) sapply(x, ismalefun))
+movies$ismale <- as.numeric(movies$ismale)
+```
+
+Next, we create two new variables, corresponding to the number of characters in the title, `titlecharnum`, and the number of words in the title, `titlewordnum`.
+
+```{r}
+wordcountfun <- function(x) {return(length(strsplit(x," ")[[1]]))}
+movies$titlewordnum <- lapply(movies$title, function(x) sapply(x, wordcountfun))
+movies$titlewordnum <- as.numeric(movies$titlewordnum)
+movies$titlecharnum <- nchar(movies$title)-movies$titlewordnum+1
+```
+
+In the count summaries below, we see there are 192 categorical instances of the `studio` variable out of 619 data points, or observations.  This variable could end up being a very good predictor (i.e. correlate strongly with the response variable), but the regression model might not generalize well to new data because, for example, the  studio(s) in the new data may be different than those in this data set.  In other words, if we fit to this catagorical variable, the model could over-fit and not generalize.  Let's create a new variable, corresponding to whether or not the production studio is "popular," as measured by frequency of occurances in this dataset.  We call this new variable `studiopop`, and set it equal to 1 if the studio is in the top 10 most frequent studios in the data set, and 0 otherwise.
+
+```{r}
+studiolist <- movies %>% group_by(studio) %>% summarise(n=n()) %>% arrange(desc(n))
+topstudiofun <- function(x) {return(as.numeric(x %in% studiolist$studio[1:10]))}
+movies$studiopop <- lapply(movies$studio, function(x) sapply(x, topstudiofun))
+movies$studiopop <- as.numeric(movies$studiopop)
+```
+
+We now remove all variables that are irrelevant for constructing our multiple regression predictive model.  For example, we should remove `thtr_rel_year` and `dvd_rel_year`, because we will use this model to predict ratings/popularity of a movie produced in a year that is not represented in the data set.  Also, we should remove variables like `actor1`, `actor2`, etc., and `director`, because there are too many categorical instances for building a generalizable predictive model.
+
+```{r}
+irrcols = c("title","actor1","actor2","actor3","actor4","actor5","imdb_url","rt_url","director","studio","thtr_rel_year","dvd_rel_year")
+cols = names(movies)
+movies = movies[cols[!cols %in% irrcols]]
+```
+
+Although the four theatre/DVD release month/day variables are numerical, they are not ordinal in the sense that December is greater than May because 12>5.  So, we convert them to factors.
+
+```{r}
+movies$thtr_rel_month <- as.factor(movies$thtr_rel_month)
+movies$thtr_rel_day <- as.factor(movies$thtr_rel_day)
+movies$dvd_rel_month <- as.factor(movies$dvd_rel_month)
+movies$dvd_rel_day <- as.factor(movies$dvd_rel_day)
+```
+
+We restrict our dataset to only complete cases, and list the remaining explanatory variable names.
+
+```{r}
+movies <- movies[complete.cases(movies),]
+cols = names(movies)
+movies = movies[cols[!cols %in% c("audience_score")]]
+names(movies)
+```
+
+Below, we plot the Rotten Tomatoes rating (RT rating) as a function of each one of the remaining 14 explanatory variables; all of these explanatory variables could in principle be chosen before producing and releasing a movie.  Some seem to correlate with `imdb_rating` strongly, while others seem to not correlate at all.  Instead of analyzing this in depth here, by predicing Pearson correlation coefficients and/or $\chi^2$ scores from independence tests, we simply eliminate unimportant variables below in our model construction.
+
+```{r, fig.width=8, fig.height=18}
+plot1 <- ggplot(aes(title_type, imdb_rating), data = movies) + geom_boxplot() + ylab("RT rating") + xlab("Title type")
+plot2 <- ggplot(aes(genre, imdb_rating), data = movies) + scale_x_discrete(labels=abbreviate) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + geom_boxplot() + ylab("") + xlab("Genre")
+plot3 <- ggplot(aes(runtime, imdb_rating), data = movies) + geom_jitter() + ylab("RT rating") + xlab("Run time") + stat_smooth(method = "lm")
+plot4 <- ggplot(aes(mpaa_rating, imdb_rating), data = movies) + geom_boxplot() + ylab("") + xlab("MPAA rating")
+plot5 <- ggplot(aes(thtr_rel_month, imdb_rating), data = movies) + geom_boxplot() + ylab("RT rating") + xlab("Theatre release month") + scale_x_discrete(labels=c("J","F","M","A","M","J","J","A","S","O","N","D"))
+plot6 <- ggplot(aes(thtr_rel_day, imdb_rating), data = movies) + scale_x_discrete(breaks=seq(2, 31, 2)) + geom_boxplot() + ylab("") + xlab("Theatre release day")
+plot7 <- ggplot(aes(dvd_rel_month, imdb_rating), data = movies) + geom_boxplot() + ylab("RT rating") + xlab("DVD release month") + scale_x_discrete(labels=c("J","F","M","A","M","J","J","A","S","O","N","D"))
+plot8 <- ggplot(aes(dvd_rel_day, imdb_rating), data = movies) + scale_x_discrete(breaks=seq(2, 31, 2)) + geom_boxplot() + ylab("") + xlab("DVD release day")
+plot9 <- ggplot(aes(thtr_rel_dow, imdb_rating), data = movies) + scale_x_discrete(labels=abbreviate) + geom_boxplot() + ylab("RT rating") + xlab("Theatre release day of week")
+plot10 <- ggplot(aes(dvd_rel_dow, imdb_rating), data = movies) + scale_x_discrete(labels=abbreviate) + geom_boxplot() + ylab("") + xlab("DVD release day of week")
+plot11 <- ggplot(aes(as.factor(ismale), imdb_rating), data = movies) + geom_boxplot() + ylab("RT rating") + xlab("Lead actor gender") + scale_x_discrete(labels=c("F","M"))
+plot12 <- ggplot(aes(as.factor(titlewordnum), imdb_rating), data = movies) + scale_x_discrete(labels=abbreviate) + geom_boxplot() + ylab("") + xlab("Words in title")
+plot13 <- ggplot(aes(titlecharnum, imdb_rating), data = movies) + geom_jitter() + ylab("RT rating") + xlab("Characters in title") + stat_smooth(method = "lm")
+plot14 <- ggplot(aes(as.factor(studiopop), imdb_rating), data = movies) + scale_x_discrete(labels=c("No","Yes")) + geom_boxplot() + ylab("") + xlab("Studio used frequently?") + annotate("text", label = "Some text")
+ggarrange(plot1, plot2, plot3, plot4, plot5, plot6, plot7, plot8, plot9, plot10, plot11, plot12, plot13, plot14, ncol = 2, nrow = 7)
+```
+
+## Part 4: Modeling
+
+We fit a multiple linear regression model called `m_imdb_rating`, and systematically eliminate unimporant variables using a stepwise backward propagation algorithm considering adjusted $R^2$ scores.  This can be done automatically in R using the `regsubsets` function from the `leaps` library.  We perform this analysis below, and print the names of the variables that maximize the adjusted $R^2$ score.  The most relevant variables are `genre`, `runtime`,  `thtr_rel_day`, and `mpaa_rating`.
+
+```{r}
+backward <- regsubsets(imdb_rating ~ .,data = movies, method = "backward")
+backsum <- summary(backward)
+names(which(backsum$which[which.max(backsum$adjr2),]))
+```
+
+We now fit a multiple linear regression model using these variables, summarize the model's properties, and perform an ANOVA analysis.  The results below show that all variables except for `thtr_rel_day` are statistically significant at the 0.05 confidence level, and the adjusted-$R^2$ score is 0.2786.  This is not a very satisfactory score, in that only 27.86% of the variance of `imdb_rating` is explaned by this model.  But, it's the best that can be done at the level of multiple linear regression.  We note that the overall p-value is effectively zero, though, indicating that there definitely is a statistically significant relationship between this set of explanatory variables and the dependent variable `imdb_rating`.
+
+For the categorical explanatory variables, the reference values are "Action & Adventure," "1," and "G" for `genre`, `thtr_rel_day`, and `mpaa_rating`, respectively.  The model coeffients give some useful insights into the behavior of `imdb_rating`. For example, all else held equal, documentaries are rated 1.719 points higher on average than action & adventure films, movies released on the 26th day of the month are rated 0.678 points lower on average than those release on the 1st day of the month (likely correlating with the Christmas holiday), and G-rated movies are rated higher on average than all other movies by at least 0.468 points.
+
+```{r}
+m_imdb_rating <- lm(imdb_rating ~ genre + runtime + thtr_rel_day + mpaa_rating, data = movies)
+summary(m_imdb_rating)
+anova(m_imdb_rating)
+```
+
+To further analyze the model, we explore the residuals to ensure that they are normally distributed about zero and exhibit constant variability.  We also check linear dependence with respect to any/all numerical explanatory variables, and ensure that the data points are independent with a visual inspection of a time series.
+
+The histogram and Q-Q plot below show that the residuals are <b>approximately normally distributed</b>, with a slight left skew.
+
+```{r}
+ggplot(aes(m_imdb_rating$residuals), data = m_imdb_rating) + geom_histogram() + xlab("Residuals")
+ggplot(data = m_imdb_rating, aes(sample = .resid)) + stat_qq() + ggtitle("Residual distribution")
+summary(m_imdb_rating$residuals)
+```
+
+The scatter plot below shows the residuals as a function of the predicted IMDB ratings.  This shows a slight "fan" shape, but it is not too noticeable, so we can conclude that the residuals have <b>approximately constant variability</b>.
+
+```{r}
+ggplot(data = m_imdb_rating, aes(x = .fitted, y = .resid)) + geom_point() + geom_hline(yintercept = 0, linetype = "dashed") + xlab("Predicted IMDB ratings") + ylab("Residuals")
+```
+
+The only numerical explanatory variable is `runtime`.  Below we show a scatterplot of the residuals with respect to the `runtime` variable.  The data looks rather randomly scattered, indicating that the dependence is <b>approximately linear</b>.
+
+```{r}
+ggplot(aes(x = movies$runtime, y = m_imdb_rating$residuals), data = m_imdb_rating) + geom_point() + xlab("Run time") + ylab("Residuals") + geom_hline(yintercept = 0, linetype = "dashed")
+```
+
+Finally, we inspect a scatter plot of the residuals with respect to the data frame index.  There are no obvious time correlations, indicating that the <b>data points are independent</b>.
+
+```{r}
+ggplot(aes(x = seq(1, length(m_imdb_rating$residuals)), y = m_imdb_rating$residuals), data = m_imdb_rating) + geom_point() + xlab("Index") + ylab("Residuals") + geom_hline(yintercept = 0, linetype = "dashed")
+```
+
+***
+
+## Part 5: Prediction
+
+Here, we predict the IMDB rating of the 2016 movie "Money Monster," chosen at random from the IMDB website:
+
+http://www.imdb.com/title/tt2241351/
+
+The IMDB rating is 6.5.  Below, we use the multiple linear regression model `m_imdb_rating` to predict the score, and make a comparison.  The predicted score, as shown below, is 6.073.  The 95% confidence interval for the prediction is [4.22,7.92], meaning there is a 95% chance a movie with these features will have an IMDB score that falls in this interval.  Sure enough, the movie score (6.5) does fall in this interval.
+
+```{r}
+genre <- "Drama"
+mpaa_rating <- "R"
+thtr_rel_day <- as.factor(13)
+runtime <- 90
+newmovie <- data.frame(genre, mpaa_rating, thtr_rel_day, runtime)
+RTrating_predict <- predict(m_imdb_rating, newmovie, interval = "prediction", level=.95)
+RTrating_predict
+```
+
+***
+
+## Part 6: Conclusion
+
+To conclude, we developed a multiple linear regression model to predict the IMDB rating of a film given many variables and/or features that could be chosen before the film's production and release.  The linear model seems to be a relativly good choice for a predictive model, although there is a great deal of variance in the relationship between IMDB rating and movie run time (the only ordinal numerical variable used in the model).  To develop a stronger predictive model, more variables may be useful.  For example, knowing the IMDB ratings of movies the actors have been in previously seems intuitively useful.  First steps towards future work on this project would include generating such features.
+
+***
